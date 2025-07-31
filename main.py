@@ -1,19 +1,65 @@
 import aiohttp
+import aiofiles
 import asyncio
 import os
 import re
 import json
 import time
 from urllib.parse import quote
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
+from PIL import Image
+import logging
 
-from astrbot.api.message_components import Node, Plain, Image
+from astrbot.api.message_components import Node, Plain, Image as AstrImage
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.all import AstrBotConfig
 from astrbot.api import logger
-from .method import TEMP_DIR, get_img_changeFormat
+
+# 创建临时缓存文件夹
+TEMP_DIR = os.path.join(os.path.dirname(__file__), "tmp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# --- 图片处理方法 ---
+async def get_img_changeFormat(url: str, save_dir: str, output_format: str = "jpeg", 
+                              ssl: bool = True) -> str:
+    """下载图片并转换为指定格式"""
+    if not url.startswith('http'):
+        raise ValueError(f"无效的图片URL: {url}")
+    
+    filename = os.path.basename(url.split('?')[0])  # 移除查询参数
+    filepath = os.path.join(save_dir, f"temp_{filename}")
+    output_path = os.path.join(save_dir, f"{os.path.splitext(filename)[0]}.{output_format}")
+    
+    try:
+        # 下载图片
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, ssl=ssl) as response:
+                if response.status != 200:
+                    raise Exception(f"图片下载失败: HTTP {response.status}")
+                
+                async with aiofiles.open(filepath, "wb") as f:
+                    await f.write(await response.read())
+        
+        # 转换格式
+        with Image.open(filepath) as img:
+            if output_format.lower() == "jpeg":
+                img = img.convert("RGB")
+            img.save(output_path, format=output_format.upper(), quality=85)
+        
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"图片处理错误: {str(e)}")
+        raise
+    finally:
+        # 清理临时文件
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
 
 # --- 自定义异常 ---
 class NoSubjectFound(Exception):
@@ -39,12 +85,24 @@ class API_Bangumi():
             "Accept": "application/json",
             "User-Agent": user_agent
         }
+        # 类型映射
         self.type_map = {
             1: "📚 书籍",
             2: "🎬 动画",
             3: "🎵 音乐",
             4: "🎮 游戏",
             6: "🌐 三次元"
+        }
+        self.character_type_map = {
+            1: "👤 角色",
+            2: "🤖 机体",
+            3: "🚢 舰船",
+            4: "🏢 组织"
+        }
+        self.person_type_map = {
+            1: "👤 个人",
+            2: "🏢 公司",
+            3: "👥 组合"
         }
         self.search_cache: Dict[str, Dict] = {}
         self.last_request_time = 0
@@ -83,6 +141,7 @@ class API_Bangumi():
             logger.error(f"API错误: {response.status} - {error_text}")
             raise BangumiApiError(f"API服务异常 ({response.status})")
 
+    # --- 条目相关方法 ---
     async def search_subjects(self, keyword: str, limit: int = 10) -> Dict[str, Any]:
         """通过关键词搜索条目"""
         cache_key = f"search:{keyword}:{limit}"
@@ -156,6 +215,149 @@ class API_Bangumi():
             
         return "\n".join(output)
 
+    async def search_characters(self, keyword: str, limit: int = 10) -> Dict[str, Any]:
+        """通过关键词搜索角色"""
+        url = f"{self.base_url}/v0/search/characters"
+        json_data = {'keyword': keyword}
+        params = {'limit': limit}
+        return await self._request(url, method='POST', json_data=json_data, params=params)
+
+    async def get_character_details(self, character_id: int) -> Dict[str, Any]:
+        """获取单个角色的详细信息"""
+        url = f"{self.base_url}/v0/characters/{character_id}"
+        return await self._request(url)
+
+    def format_character_info(self, character: Dict[str, Any]) -> str:
+        """格式化角色信息为Markdown"""
+        name = character.get('name', '未知名称')
+        
+        type_id = character.get('type', 1)
+        type_str = self.character_type_map.get(type_id, self.character_type_map[1])
+        
+        gender = character.get('gender', '未知')
+        summary = character.get('summary', '暂无简介')
+        summary = re.sub(r'<br\s*/?>', '\n', summary)
+        summary = re.sub(r'<.*?>', '', summary)
+        
+        info_str = (
+            f"**{name}**\n"
+            f"类型: {type_str} | 性别: {gender}\n"
+            f"ID: `{character.get('id')}`\n"
+            f"---\n"
+            f"{summary}"
+        )
+        return info_str
+
+    def format_character_list(self, data: Dict[str, Any], limit: int) -> str:
+        """格式化角色搜索结果"""
+        results = data.get('data', [])
+        if not results:
+            return "🔍 未找到相关角色"
+        
+        output = ["找到以下角色：\n"]
+        for i, item in enumerate(results[:limit], 1):
+            item_name = item.get('name', '未知名称')
+            item_type = self.character_type_map.get(item.get('type'), '👤 角色')
+            output.append(f"{i}. {item_name} ({item_type}) ID: `{item['id']}`")
+        
+        if data.get('total', 0) > limit:
+            output.append(f"\n共找到 {data['total']} 个结果, 显示前 {limit} 个")
+            
+        return "\n".join(output)
+    
+    # --- 新增人物相关方法 ---
+    async def search_persons(self, keyword: str, limit: int = 10) -> Dict[str, Any]:
+        """通过关键词搜索人物"""
+        url = f"{self.base_url}/v0/search/persons"
+        json_data = {'keyword': keyword}
+        params = {'limit': limit}
+        return await self._request(url, method='POST', json_data=json_data, params=params)
+
+    async def get_person_details(self, person_id: int) -> Dict[str, Any]:
+        """获取单个人物的详细信息"""
+        url = f"{self.base_url}/v0/persons/{person_id}"
+        return await self._request(url)
+
+    def format_person_info(self, person: Dict[str, Any]) -> str:
+        """格式化人物信息为Markdown"""
+        name = person.get('name', '未知名称')
+        
+        type_id = person.get('type', 1)
+        type_str = self.person_type_map.get(type_id, self.person_type_map[1])
+        
+        career = ", ".join(person.get('career', [])) or "未知"
+        summary = person.get('summary', '暂无简介')
+        summary = re.sub(r'<br\s*/?>', '\n', summary)
+        summary = re.sub(r'<.*?>', '', summary)
+        
+        info_str = (
+            f"**{name}**\n"
+            f"类型: {type_str} | 职业: {career}\n"
+            f"ID: `{person.get('id')}`\n"
+            f"---\n"
+            f"{summary}"
+        )
+        return info_str
+
+    def format_person_list(self, data: Dict[str, Any], limit: int) -> str:
+        """格式化人物搜索结果"""
+        results = data.get('data', [])
+        if not results:
+            return "🔍 未找到相关人物"
+        
+        output = ["找到以下人物：\n"]
+        for i, item in enumerate(results[:limit], 1):
+            item_name = item.get('name', '未知名称')
+            item_type = self.person_type_map.get(item.get('type'), '👤 个人')
+            output.append(f"{i}. {item_name} ({item_type}) ID: `{item['id']}`")
+        
+        if data.get('total', 0) > limit:
+            output.append(f"\n共找到 {data['total']} 个结果, 显示前 {limit} 个")
+            
+        return "\n".join(output)
+    
+    # --- 新增用户相关方法 ---
+    async def get_user_details(self, username: str) -> Dict[str, Any]:
+        """获取用户详细信息"""
+        encoded_username = quote(username)
+        url = f"{self.base_url}/v0/users/{encoded_username}"
+        return await self._request(url)
+
+    def format_user_info(self, user: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        """格式化用户信息并返回头像URL"""
+        username = user.get('username', '未知用户名')
+        nickname = user.get('nickname', username)
+        sign = user.get('sign', '暂无签名')
+        sign = re.sub(r'<.*?>', '', sign)  # 移除HTML标签
+        
+        # 用户组映射
+        group_map = {
+            1: "管理员",
+            2: "Bangumi 管理猿",
+            3: "天窗管理猿",
+            4: "禁言用户",
+            5: "禁止访问用户",
+            8: "人物管理猿",
+            9: "维基条目管理猿",
+            10: "用户",
+            11: "维基人"
+        }
+        group_id = user.get('user_group', 10)
+        group_str = group_map.get(group_id, "用户")
+        
+        # 获取头像URL
+        avatar_url = None
+        if 'avatar' in user and 'large' in user['avatar']:
+            avatar_url = user['avatar']['large']
+        
+        info_str = (
+            f"**{nickname} (@{username})**\n"
+            f"用户组: {group_str}\n"
+            f"签名: {sign}\n"
+            f"ID: `{user.get('id')}`"
+        )
+        return info_str, avatar_url
+
 # --- Astrbot 插件主类 ---
 @register(
     "astrbot_plugin_bangumi",
@@ -169,7 +371,7 @@ class BangumiPlugin(Star):
         super().__init__(context)
         self.config = config
         self.access_token = self.config.get("access_token", "")
-        self.user_agent = self.config.get("user_agent", "AstrBot-Bangumi-Plugin/1.0 (https://github.com/yourname/yourrepo)")
+        self.user_agent = self.config.get("user_agent", "AstrBot-Bangumi-Plugin/2.0")
         self.max_fuzzy_results = int(self.config.get("max_fuzzy_results", 5))
         self.use_forward_msg = self.config.get("use_forward", "关闭") == "开启"
         self.use_filesystem = self.config.get("if_fromfilesystem", "关闭") == "开启"
@@ -192,31 +394,34 @@ class BangumiPlugin(Star):
             return event.plain_result("❌ 格式错误，用法: /bgm搜索 <关键词|ID>")
         
         query = cmd[1].strip()
-        is_id_search = query.isdigit()
         
         try:
-            # 先发送搜索中提示
+            # 先发送搜索中提示（不需要await）
             event.plain_result(f"🔍 正在搜索: {query}")
             
-            if is_id_search:
-                subject_id = int(query)
-                subject = await self.bgm_api.get_subject_details(subject_id)
+            if query.isdigit():
+                # ID搜索
+                subject = await self.bgm_api.get_subject_details(int(query))
                 info_text = self.bgm_api.format_subject_info(subject)
-                message_content = await self._build_reply(subject, info_text)
+                img_url = subject.get('images', {}).get('large')
             else:
+                # 关键词搜索
                 search_data = await self.bgm_api.search_subjects(query, limit=1)
-                
                 if not search_data.get('data'):
                     return event.plain_result(f"❌ 未找到相关条目: {query}")
                 
                 subject_id = search_data['data'][0]['id']
                 subject = await self.bgm_api.get_subject_details(subject_id)
                 info_text = self.bgm_api.format_subject_info(subject)
-                message_content = await self._build_reply(subject, info_text)
+                img_url = subject.get('images', {}).get('large')
             
-            # 发送最终结果
-            return event.chain_result(message_content)
-            
+            # 构建回复
+            try:
+                return await self._build_reply(img_url, info_text, event)
+            except Exception as e:
+                logger.warning(f"图片处理失败: {e}")
+                return event.plain_result(info_text)
+                
         except NoSubjectFound:
             return event.plain_result(f"❌ 未找到相关条目: {query}")
         except BangumiRateLimitError:
@@ -259,25 +464,195 @@ class BangumiPlugin(Star):
             logger.exception("模糊搜索异常")
             return event.plain_result("❌ 内部错误，请查看日志")
 
-    async def _build_reply(self, subject: Dict, info_text: str) -> list:
+    @filter.command("bgm角色搜索")
+    async def fuzzy_search_characters(self, event: AstrMessageEvent):
+        """模糊搜索角色 - 用法: /bgm角色搜索 <关键词>"""
+        if not self.bgm_api:
+            return event.plain_result("❌ Bangumi插件未正确配置")
+        
+        cmd = event.message_str.split(maxsplit=1)
+        if len(cmd) < 2:
+            return event.plain_result("❌ 格式错误，用法: /bgm角色搜索 <关键词>")
+        
+        query = cmd[1].strip()
+        
+        try:
+            event.plain_result(f"🔍 正在搜索角色: {query}")
+            search_data = await self.bgm_api.search_characters(query, limit=self.max_fuzzy_results)
+            result_text = self.bgm_api.format_character_list(search_data, self.max_fuzzy_results)
+            
+            if self.use_forward_msg:
+                node = Node(uin=event.bot.self_id, name="Bangumi角色搜索", content=[Plain(result_text)])
+                return event.chain_result([node])
+            return event.plain_result(result_text)
+            
+        except BangumiRateLimitError:
+            return event.plain_result("⚠️ 请求过于频繁，请稍后再试")
+        except BangumiApiError as e:
+            return event.plain_result(f"❌ API错误: {str(e)}")
+        except Exception as e:
+            logger.exception("角色搜索异常")
+            return event.plain_result("❌ 内部错误，请查看日志")
+
+    @filter.command("bgm角色")
+    async def get_character(self, event: AstrMessageEvent):
+        """获取角色详情 - 用法: /bgm角色 <角色ID>"""
+        if not self.bgm_api:
+            return event.plain_result("❌ Bangumi插件未正确配置")
+        
+        cmd = event.message_str.split(maxsplit=1)
+        if len(cmd) < 2 or not cmd[1].strip().isdigit():
+            return event.plain_result("❌ 格式错误，用法: /bgm角色 <角色ID>")
+        
+        character_id = int(cmd[1].strip())
+        
+        try:
+            event.plain_result(f"🔍 正在查询角色: {character_id}")
+            character = await self.bgm_api.get_character_details(character_id)
+            info_text = self.bgm_api.format_character_info(character)
+            
+            # 获取角色图片URL
+            img_url = character.get('images', {}).get('large') if character.get('images') else None
+            
+            # 构建回复消息
+            return await self._build_reply(img_url, info_text, event)
+            
+        except NoSubjectFound:
+            return event.plain_result(f"❌ 未找到相关角色: {character_id}")
+        except BangumiRateLimitError:
+            return event.plain_result("⚠️ 请求过于频繁，请稍后再试")
+        except BangumiApiError as e:
+            return event.plain_result(f"❌ API错误: {str(e)}")
+        except Exception as e:
+            logger.exception("角色查询异常")
+            return event.plain_result("❌ 内部错误，请查看日志")
+
+    @filter.command("bgm人物搜索")
+    async def fuzzy_search_persons(self, event: AstrMessageEvent):
+        """模糊搜索人物 - 用法: /bgm人物搜索 <关键词>"""
+        if not self.bgm_api:
+            return event.plain_result("❌ Bangumi插件未正确配置")
+        
+        cmd = event.message_str.split(maxsplit=1)
+        if len(cmd) < 2:
+            return event.plain_result("❌ 格式错误，用法: /bgm人物搜索 <关键词>")
+        
+        query = cmd[1].strip()
+        
+        try:
+            event.plain_result(f"🔍 正在搜索人物: {query}")
+            search_data = await self.bgm_api.search_persons(query, limit=self.max_fuzzy_results)
+            result_text = self.bgm_api.format_person_list(search_data, self.max_fuzzy_results)
+            
+            if self.use_forward_msg:
+                node = Node(uin=event.bot.self_id, name="Bangumi人物搜索", content=[Plain(result_text)])
+                return event.chain_result([node])
+            return event.plain_result(result_text)
+            
+        except BangumiRateLimitError:
+            return event.plain_result("⚠️ 请求过于频繁，请稍后再试")
+        except BangumiApiError as e:
+            return event.plain_result(f"❌ API错误: {str(e)}")
+        except Exception as e:
+            logger.exception("人物搜索异常")
+            return event.plain_result("❌ 内部错误，请查看日志")
+
+    @filter.command("bgm人物")
+    async def get_person(self, event: AstrMessageEvent):
+        """获取人物详情 - 用法: /bgm人物 <人物ID>"""
+        if not self.bgm_api:
+            return event.plain_result("❌ Bangumi插件未正确配置")
+        
+        cmd = event.message_str.split(maxsplit=1)
+        if len(cmd) < 2 or not cmd[1].strip().isdigit():
+            return event.plain_result("❌ 格式错误，用法: /bgm人物 <人物ID>")
+        
+        person_id = int(cmd[1].strip())
+        
+        try:
+            event.plain_result(f"🔍 正在查询人物: {person_id}")
+            person = await self.bgm_api.get_person_details(person_id)
+            info_text = self.bgm_api.format_person_info(person)
+            
+            # 获取人物图片URL
+            img_url = person.get('images', {}).get('large') if person.get('images') else None
+            
+            # 构建回复消息
+            return await self._build_reply(img_url, info_text, event)
+            
+        except NoSubjectFound:
+            return event.plain_result(f"❌ 未找到相关人物: {person_id}")
+        except BangumiRateLimitError:
+            return event.plain_result("⚠️ 请求过于频繁，请稍后再试")
+        except BangumiApiError as e:
+            return event.plain_result(f"❌ API错误: {str(e)}")
+        except Exception as e:
+            logger.exception("人物查询异常")
+            return event.plain_result("❌ 内部错误，请查看日志")
+
+    @filter.command("bgm用户")
+    async def get_user(self, event: AstrMessageEvent):
+        """获取用户信息 - 用法: /bgm用户 <用户名>"""
+        if not self.bgm_api:
+            return event.plain_result("❌ Bangumi插件未正确配置")
+        
+        cmd = event.message_str.split(maxsplit=1)
+        if len(cmd) < 2:
+            return event.plain_result("❌ 格式错误，用法: /bgm用户 <用户名>")
+        
+        username = cmd[1].strip()
+        
+        try:
+            event.plain_result(f"🔍 正在查询用户: {username}")
+            user = await self.bgm_api.get_user_details(username)
+            info_text, avatar_url = self.bgm_api.format_user_info(user)
+            
+            # 构建回复消息
+            return await self._build_reply(avatar_url, info_text, event)
+            
+        except NoSubjectFound:
+            return event.plain_result(f"❌ 未找到相关用户: {username}")
+        except BangumiRateLimitError:
+            return event.plain_result("⚠️ 请求过于频繁，请稍后再试")
+        except BangumiApiError as e:
+            return event.plain_result(f"❌ API错误: {str(e)}")
+        except Exception as e:
+            logger.exception("用户查询异常")
+            return event.plain_result("❌ 内部错误，请查看日志")
+
+    # --- 通用构建回复方法 ---
+    async def _build_reply(self, img_url: Optional[str], info_text: str, event: AstrMessageEvent) -> Any:
         """构建回复消息组件列表"""
-        img_url = subject.get('images', {}).get('large')
         message_content = []
+        temp_file_path = None
         
         if img_url:
             try:
+                # 下载图片并转换格式
                 img_path = await get_img_changeFormat(img_url, TEMP_DIR, ssl=False)
+                temp_file_path = img_path
+                
                 if self.use_filesystem:
-                    message_content.append(Image.fromFileSystem(img_path))
+                    message_content.append(AstrImage.fromFileSystem(img_path))
                 else:
                     with open(img_path, "rb") as f:
-                        message_content.append(Image.fromBytes(f.read()))
-                os.remove(img_path)
+                        message_content.append(AstrImage.fromBytes(f.read()))
             except Exception as e:
                 logger.warning(f"图片处理失败: {e}")
         
         message_content.append(Plain(info_text))
-        return message_content
+        
+        # 发送消息
+        result = event.chain_result(message_content)
+        
+        # 清理临时文件
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception as e:
+                logger.warning(f"临时文件清理失败: {e}")
+        
+        return result
 
     async def terminate(self):
         """插件卸载"""
