@@ -1,0 +1,22 @@
+{
+    "access_token": {
+        "description": "Bangumi API访问令牌（部分接口需授权）",
+        "type": "string",
+        "hint": "在https://next.bgm.tv/demo/access-token生成，格式为Bearer令牌",
+        "default": ""
+    },
+    "user_agent": {
+        "description": "请求头User-Agent标识",
+        "type": "string",
+        "hint": "需包含开发者ID、应用名称、版本（可选）及项目主页，例如：AstrBot-Bangumi-Plugin/1.0 (https://github.com/yourname/yourrepo)",
+        "default": "AstrBot-Bangumi-Plugin/1.0 (https://github.com/yourname/yourrepo)"
+    },
+    "max_fuzzy_results": {
+        "description": "模糊搜索返回的最大结果数量",
+        "type": "int", 
+        "hint": "取值范围1-200，数值越大返回结果越多",
+        "default": 5,
+        "min": 1,
+        "max": 200
+    }
+}
