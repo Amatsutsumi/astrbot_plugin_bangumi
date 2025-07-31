@@ -73,4 +73,4 @@
 - 修复特殊字符搜索问题
 
 > 遇到问题请提交Issue：  
-> [GitHub仓库](https://github.com/yourname/yourrepo)
+> [GitHub仓库](https://github.com/Amatsutsumi/astrbot_plugin_bangumi)
